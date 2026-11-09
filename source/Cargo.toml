@@ -27,6 +27,8 @@ chrono = "0.4"
 rfd = "0.14"
 libloading = "0.8"
 rand = "0.8"
+rtrb = "0.3"
+rubato = { version = "0.16", default-features = false }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

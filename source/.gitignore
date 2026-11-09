@@ -1,0 +1,6 @@
+/target/
+/dist/
+/RinkaSoundBridge-LAN.zip
+/.tools/
+*.log
+/Savedata/rinka_soundbridge_config.json*

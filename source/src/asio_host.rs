@@ -1021,6 +1021,9 @@ pub fn open_asio_control_panel(driver_name: &str) -> Result<(), String> {
 type AsioProcessCallback = Box<dyn FnMut(&[f32], &mut [f32], usize) + Send>;
 
 struct AsioCallbackContext {
+    capture_only: bool,
+    rate_faulted: bool,
+    expected_sample_rate: f64,
     buf_infos: Vec<ASIOBufferInfo>,
     in_types: [ASIOSampleType; 2],
     out_types: [ASIOSampleType; 2],
@@ -1055,24 +1058,29 @@ unsafe extern "C" fn asio_buffer_switch(double_buffer_index: i32, _direct_proces
     }
 
     let n = ctx.buffer_size;
-    // 1. Konversi 2 kanal Input ASIO -> Interleaved f32
-    for ch in 0..2 {
+    if ctx.rate_faulted && ctx.capture_only {
+        (ctx.process_cb)(&[], &mut [], 0);
+        return;
+    }
+    let input_channels = if ctx.capture_only { 1 } else { 2 };
+    // Convert only the requested input buffers for a capture-only stream.
+    for ch in 0..input_channels {
         let src_ptr = ctx.buf_infos[ch].buffers[idx];
         let st = ctx.in_types[ch];
         for i in 0..n {
-            ctx.in_interleaved[i * 2 + ch] = read_asio_sample(src_ptr, st, i);
+            ctx.in_interleaved[i * input_channels + ch] = read_asio_sample(src_ptr, st, i);
         }
     }
 
     // 2. Jalankan Pipeline DSP + VST3 + FIFO
     let in_ptr = ctx.in_interleaved.as_ptr();
     let out_ptr = ctx.out_interleaved.as_mut_ptr();
-    let in_slice = std::slice::from_raw_parts(in_ptr, n * 2);
-    let out_slice = std::slice::from_raw_parts_mut(out_ptr, n * 2);
+    let in_slice = std::slice::from_raw_parts(in_ptr, n * input_channels);
+    let out_slice = std::slice::from_raw_parts_mut(out_ptr, if ctx.capture_only { 0 } else { n * 2 });
     (ctx.process_cb)(in_slice, out_slice, n);
 
     // 3. Konversi Interleaved f32 -> 2 kanal Output ASIO
-    for ch in 0..2 {
+    for ch in 0..if ctx.capture_only { 0 } else { 2 } {
         let dst_ptr = ctx.buf_infos[2 + ch].buffers[idx];
         let st = ctx.out_types[ch];
         for i in 0..n {
@@ -1080,7 +1088,7 @@ unsafe extern "C" fn asio_buffer_switch(double_buffer_index: i32, _direct_proces
         }
     }
 
-    if !ctx.iasio_ptr.is_null() {
+    if !ctx.capture_only && !ctx.iasio_ptr.is_null() {
         let vtbl = &**(ctx.iasio_ptr as *mut *const IASIOVtbl);
         let _ = (vtbl.output_ready)(ctx.iasio_ptr);
     }
@@ -1088,13 +1096,23 @@ unsafe extern "C" fn asio_buffer_switch(double_buffer_index: i32, _direct_proces
 
 unsafe extern "C" fn asio_sample_rate_changed(s_rate: f64) {
     log_warn(format!("[ASIO] Driver melaporkan perubahan sample rate ke {} Hz", s_rate));
+    if let Some(mut context) = GLOBAL_ASIO_CTX.try_lock() {
+        if let Some(context) = context.as_mut() {
+            context.rate_faulted |= (s_rate - context.expected_sample_rate).abs() > 0.5;
+        }
+    }
 }
 
 unsafe extern "C" fn asio_message_cb(selector: i32, _value: i32, _message: *mut c_void, _opt: *mut f64) -> i32 {
     match selector {
         1 => 1,      // kAsioSelectorSupported
         2 => 2,      // kAsioEngineVersion -> v2
-        3 => 1,      // kAsioResetRequest
+        3 => {
+            if let Some(mut context) = GLOBAL_ASIO_CTX.try_lock() {
+                if let Some(context) = context.as_mut() { context.rate_faulted = true; }
+            }
+            1
+        },
         _ => 0,
     }
 }
@@ -1189,6 +1207,18 @@ impl AsioStreamHandle {
         requested_buf: u32,
         process_cb: AsioProcessCallback,
     ) -> Result<Self, String> {
+        Self::start_impl(driver_name, requested_sr, requested_buf, None, process_cb)
+    }
+
+    pub fn start_capture(driver_name: &str, requested_sr: u32, requested_buf: u32,
+        channel: u16, mut callback: Box<dyn FnMut(&[f32], usize) + Send>) -> Result<Self, String> {
+        Self::start_impl(driver_name, requested_sr, requested_buf, Some(channel),
+            Box::new(move |input, _, frames| callback(input, frames)))
+    }
+
+    fn start_impl(driver_name: &str, requested_sr: u32, requested_buf: u32,
+        capture_channel: Option<u16>, process_cb: AsioProcessCallback) -> Result<Self, String> {
+        if GLOBAL_ASIO_CTX.lock().is_some() { return Err("An ASIO stream is already active".into()); }
         let drivers = scan_asio_drivers();
         let drv = drivers
             .iter()
@@ -1219,7 +1249,9 @@ impl AsioStreamHandle {
 
             let mut num_in = 0i32;
             let mut num_out = 0i32;
-            if (vtbl.get_channels)(iasio, &mut num_in, &mut num_out) != ASE_OK || num_in < 1 || num_out < 1 {
+            if (vtbl.get_channels)(iasio, &mut num_in, &mut num_out) != ASE_OK || num_in < 1
+                || (capture_channel.is_none() && num_out < 1)
+                || capture_channel.is_some_and(|channel| channel as i32 >= num_in) {
                 (vtbl.release)(iasio);
                 return Err(format!("Insufficient ASIO channels (In={}, Out={})", num_in, num_out));
             }
@@ -1230,6 +1262,10 @@ impl AsioStreamHandle {
             let mut cur_sr = requested_sr as f64;
             let _ = (vtbl.get_sample_rate)(iasio, &mut cur_sr);
             let active_sr = (cur_sr.round() as u32).max(44100);
+            if capture_channel.is_some() && (cur_sr - requested_sr as f64).abs() > 0.5 {
+                (vtbl.release)(iasio);
+                return Err(format!("ASIO capture requires {} Hz (driver is at {} Hz)", requested_sr, cur_sr));
+            }
 
             let mut min_sz = 64i32;
             let mut max_sz = 2048i32;
@@ -1267,25 +1303,31 @@ impl AsioStreamHandle {
 
             let mut in_types = [ASIOST_INT32_LSB; 2];
             let mut out_types = [ASIOST_INT32_LSB; 2];
-            for ch in 0..2 {
+            if let Some(channel) = capture_channel {
+                buf_infos.truncate(1);
+                buf_infos[0].channel_num = channel as i32;
+            }
+            for ch in 0..if capture_channel.is_some() { 1 } else { 2 } {
                 let mut cinfo: ASIOChannelInfo = std::mem::zeroed();
                 cinfo.channel = buf_infos[ch].channel_num;
                 cinfo.is_input = 1;
                 if (vtbl.get_channel_info)(iasio, &mut cinfo) == ASE_OK {
                     in_types[ch] = cinfo.sample_type;
                 }
-                let mut oinfo: ASIOChannelInfo = std::mem::zeroed();
-                oinfo.channel = buf_infos[2 + ch].channel_num;
-                oinfo.is_input = 0;
-                if (vtbl.get_channel_info)(iasio, &mut oinfo) == ASE_OK {
-                    out_types[ch] = oinfo.sample_type;
+                if capture_channel.is_none() {
+                    let mut oinfo: ASIOChannelInfo = std::mem::zeroed();
+                    oinfo.channel = buf_infos[2 + ch].channel_num;
+                    oinfo.is_input = 0;
+                    if (vtbl.get_channel_info)(iasio, &mut oinfo) == ASE_OK {
+                        out_types[ch] = oinfo.sample_type;
+                    }
                 }
             }
 
             if (vtbl.create_buffers)(
                 iasio,
                 buf_infos.as_mut_ptr(),
-                4,
+                buf_infos.len() as i32,
                 active_buf as i32,
                 &ASIO_CALLBACKS,
             ) != ASE_OK
@@ -1295,12 +1337,15 @@ impl AsioStreamHandle {
             }
 
             *GLOBAL_ASIO_CTX.lock() = Some(AsioCallbackContext {
+                capture_only: capture_channel.is_some(),
+                rate_faulted: false,
+                expected_sample_rate: cur_sr,
                 buf_infos,
                 in_types,
                 out_types,
                 buffer_size: active_buf,
-                in_interleaved: vec![0.0; active_buf * 2],
-                out_interleaved: vec![0.0; active_buf * 2],
+                in_interleaved: vec![0.0; active_buf * if capture_channel.is_some() { 1 } else { 2 }],
+                out_interleaved: vec![0.0; if capture_channel.is_some() { 0 } else { active_buf * 2 }],
                 iasio_ptr: iasio,
                 boosted: false,
                 process_cb,
@@ -1321,7 +1366,7 @@ impl AsioStreamHandle {
         }
         #[cfg(not(windows))]
         {
-            let _ = (drv, requested_sr, requested_buf, process_cb);
+            let _ = (drv, requested_sr, requested_buf, capture_channel, process_cb);
             Err("ASIO is only available on Windows".into())
         }
     }
@@ -3050,6 +3095,18 @@ static BUS_LINE_A_OUT: OnceLock<SharedAsioBus> = OnceLock::new();
 static BUS_LINE_B_IN: OnceLock<SharedAsioBus> = OnceLock::new();
 static BUS_DSP_A_OUT: OnceLock<SharedAsioBus> = OnceLock::new();
 static BUS_DSP_B_IN: OnceLock<SharedAsioBus> = OnceLock::new();
+// Separate mapping: preserves the established audio-bus ABI for installed drivers.
+static LAN_SERVER_GUARD: OnceLock<SharedAsioBus> = OnceLock::new();
+
+pub fn mark_lan_server_active(active: bool) {
+    let bus = LAN_SERVER_GUARD.get_or_init(|| SharedAsioBus::open_named("Local\\RinkaLanServer_v1"));
+    if active { bus.layout().last_write_epoch_ms.store(now_epoch_ms(), Ordering::Release); }
+    else { bus.mark_writer_stopped(); }
+}
+
+fn lan_server_is_active() -> bool {
+    LAN_SERVER_GUARD.get_or_init(|| SharedAsioBus::open_named("Local\\RinkaLanServer_v1")).is_writer_active()
+}
 
 #[repr(C)]
 pub struct HybridSensorTelemetryLayout {
@@ -6050,7 +6107,7 @@ unsafe extern "system" fn v_rsb_flex_asio_start(this: *mut c_void) -> ASIOError 
     {
         let saved = read_saved_rsb_flex_asio_reg_config();
         let bus_a_active = get_dsp_rsb_bus_a_out().is_writer_active();
-        if !bus_a_active && (!saved.input_device.is_empty() || !saved.output_device.is_empty()) {
+        if !bus_a_active && !lan_server_is_active() && (!saved.input_device.is_empty() || !saved.output_device.is_empty()) {
             let vc_sr = saved_sr;
             *obj.sample_rate.lock() = vc_sr as f64;
             let host = cpal::default_host();
@@ -6504,4 +6561,40 @@ pub unsafe extern "system" fn DllGetClassObject(
 #[no_mangle]
 pub unsafe extern "system" fn DllCanUnloadNow() -> i32 {
     1 // S_FALSE
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn capture_callback_reads_one_channel_and_detects_actual_rate_changes() {
+        let mut samples = [0.25f32, -0.5, 0.75, 0.0];
+        let observed = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let result = Arc::clone(&observed);
+        *GLOBAL_ASIO_CTX.lock() = Some(AsioCallbackContext {
+            capture_only: true, rate_faulted: false, expected_sample_rate: 48000.0,
+            buf_infos: vec![ASIOBufferInfo { is_input: 1, channel_num: 3,
+                buffers: [samples.as_mut_ptr() as *mut c_void; 2] }],
+            in_types: [ASIOST_FLOAT32_LSB; 2], out_types: [ASIOST_FLOAT32_LSB; 2],
+            buffer_size: samples.len(), in_interleaved: vec![0.0; samples.len()],
+            out_interleaved: Vec::new(), iasio_ptr: ptr::null_mut(), boosted: true,
+            process_cb: Box::new(move |input, output, frames| {
+                assert!(output.is_empty());
+                if frames == 0 { result.lock().clear(); }
+                else { *result.lock() = input.to_vec(); }
+            }),
+        });
+        unsafe {
+            asio_buffer_switch(0, 1);
+            assert_eq!(*observed.lock(), samples.to_vec());
+            asio_sample_rate_changed(48000.0);
+            asio_buffer_switch(1, 1);
+            assert_eq!(*observed.lock(), samples.to_vec());
+            asio_sample_rate_changed(44100.0);
+            asio_buffer_switch(0, 1);
+            assert!(observed.lock().is_empty());
+        }
+        *GLOBAL_ASIO_CTX.lock() = None;
+    }
 }

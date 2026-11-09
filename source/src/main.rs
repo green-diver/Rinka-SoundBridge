@@ -40,6 +40,9 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use rinka_soundbridge_core::lan::{LanConfig, LanRole, LanSession, CaptureBackend, ServerBridge};
+use std::sync::atomic::Ordering;
+mod lan_ui;
 
 pub const APP_WINDOW_TITLE: &str = "Rinka SoundBridge v2.0 Beta2";
 
@@ -551,6 +554,11 @@ struct VstPickerModal {
 }
 
 pub struct RinkaSoundBridgeApp {
+    lan_config: LanConfig,
+    lan_session: Option<LanSession>,
+    lan_error: String,
+    lan_address: String,
+    saved_config: AppConfig,
     wasapi_inputs: Vec<WasapiDeviceInfo>,
     wasapi_outputs: Vec<WasapiDeviceInfo>,
     asio_drivers: Vec<AsioDriverInfo>,
@@ -614,15 +622,24 @@ impl RinkaSoundBridgeApp {
         // Cek requirement FlexASIO & ASIO saat .exe dijalankan:
         // - Jika sudah terinstal di PC: langsung lanjut dalam <0.1 ms!
         // - Jika belum ada: otomatis unduh & instal lalu daftarkan driver ASIO sebelum memindai perangkat.
-        ensure_asio_requirements_installed(false);
+        let mut saved_config = AppConfig::load().unwrap_or_default();
+        if std::env::args().any(|a| a == "--lan-client") { saved_config.lan.role = LanRole::Client; }
+        if std::env::args().any(|a| a == "--lan-server") { saved_config.lan.role = LanRole::Server; }
+        let role = saved_config.lan.role;
+        if role == LanRole::Local { ensure_asio_requirements_installed(false); }
 
         let (wasapi_inputs, wasapi_outputs) = get_wasapi_devices();
         let asio_drivers = get_asio_devices();
-        let scanned_vst_cache = VSTScanner::scan_plugins();
+        let scanned_vst_cache = if role == LanRole::Client { BTreeMap::new() } else { VSTScanner::scan_plugins() };
         let mut perf_monitor = ProcessPerfMonitor::new();
         let (cpu_pct, ram_mb) = perf_monitor.sample();
 
         let mut app = Self {
+            lan_config: saved_config.lan.clone(),
+            lan_session: None,
+            lan_error: String::new(),
+            lan_address: lan_ui::local_address(),
+            saved_config,
             wasapi_inputs,
             wasapi_outputs,
             asio_drivers,
@@ -652,8 +669,8 @@ impl RinkaSoundBridgeApp {
             gpu_boost_lock_ui_open: false,
             gpu_boost_lock_mhz: 1980,
             gpu_boost_lock_failsafe: true,
-            gpu_telemetry: poll_gpu_clock_telemetry_with_failsafe(true),
-            asio_notes_text: load_or_create_asio_notes_txt(),
+            gpu_telemetry: if role == LanRole::Client { GpuTelemetrySnapshot::default() } else { poll_gpu_clock_telemetry_with_failsafe(true) },
+            asio_notes_text: if role == LanRole::Client { String::new() } else { load_or_create_asio_notes_txt() },
             last_watchdog_tick: Instant::now(),
             last_perf_tick: Instant::now(),
             last_latency_tick: Instant::now(),
@@ -747,6 +764,7 @@ impl RinkaSoundBridgeApp {
     /// Menjaga `BUS_DSP_B_IN` di Shared Memory selalu terkunci 100% pada `self.dsp_rsb_config` milik user
     /// di setiap frame sehingga tidak pernah bisa kembali ke 90ms/100ms saat Vonovox di-stop/start!
     fn enforce_live_dsp_b_cushion(&self) {
+        if self.lan_config.role == LanRole::Client || (self.lan_config.role == LanRole::Server && self.lan_session.is_none()) { return; }
         if self.pipeline_a.driver_backend == DriverBackend::RsbAsio {
             return;
         }
@@ -831,7 +849,7 @@ impl RinkaSoundBridgeApp {
             self.win_w = Some(w);
             self.win_h = Some(h);
         }
-        let mut cfg = AppConfig::default();
+        let mut cfg = self.saved_config.clone();
         cfg.global.buffer_size = self.pipeline_a.buffer_size;
         cfg.global.sample_rate = self.pipeline_a.sample_rate;
         cfg.global.fifo_mode = self.pipeline_a.fifo_mode.clone();
@@ -857,13 +875,31 @@ impl RinkaSoundBridgeApp {
         cfg.asio_vc = self.asio_vc_profile.clone();
         cfg.asio_dsp_rsb = self.dsp_rsb_config.clone();
         cfg.rsb_asio = self.rsb_asio_config.clone();
+        if self.lan_config.role == LanRole::Client {
+            let global = cfg.global.clone();
+            cfg = self.saved_config.clone();
+            cfg.global.window_x = global.window_x;
+            cfg.global.window_y = global.window_y;
+            cfg.global.window_w = global.window_w;
+            cfg.global.window_h = global.window_h;
+        } else if self.lan_config.role == LanRole::Server {
+            // Server processing shares plugin state; Local-mode device routing remains separate.
+            for (line, saved) in [(&mut cfg.line_a, &self.saved_config.line_a), (&mut cfg.line_b, &self.saved_config.line_b)] {
+                line.driver_mode = saved.driver_mode.clone();
+                line.input_device_name = saved.input_device_name.clone();
+                line.output_device_name = saved.output_device_name.clone();
+                line.asio_driver_name = saved.asio_driver_name.clone();
+            }
+            cfg.global.sample_rate = self.saved_config.global.sample_rate;
+            cfg.global.buffer_size = self.saved_config.global.buffer_size;
+        }
+        cfg.lan = self.lan_config.clone();
+        self.saved_config = cfg.clone();
         cfg.save();
     }
 
     fn load_config_on_startup(&mut self) {
-        let Some(cfg) = AppConfig::load() else {
-            return;
-        };
+        let cfg = self.saved_config.clone();
 
         let buf = cfg.global.buffer_size;
         let sr = cfg.global.sample_rate;
@@ -876,6 +912,7 @@ impl RinkaSoundBridgeApp {
         if self.win_x.is_some() && self.win_y.is_some() {
             self.win_pos_apply_frames = 3;
         }
+        if self.lan_config.role == LanRole::Client { return; }
 
         for p in [&mut self.pipeline_a, &mut self.pipeline_b] {
             p.buffer_size = buf;
@@ -1012,11 +1049,19 @@ impl RinkaSoundBridgeApp {
         self.pipeline_a.rsb_asio_config = self.rsb_asio_config.clone();
         self.pipeline_b.rsb_asio_config = self.rsb_asio_config.clone();
 
-        let _ = self.sync_unified_asio_config(true);
-        get_dsp_rsb_bus_b_in().reset_spike_and_resync_cushion();
-        rinka_soundbridge_core::asio_host::inject_probe_into_running_vonovox_if_needed();
-        self.pipeline_a.restart_stream();
-        self.pipeline_b.restart_stream();
+        if self.lan_config.role == LanRole::Local {
+            let _ = self.sync_unified_asio_config(true);
+            get_dsp_rsb_bus_b_in().reset_spike_and_resync_cushion();
+            rinka_soundbridge_core::asio_host::inject_probe_into_running_vonovox_if_needed();
+            self.pipeline_a.restart_stream();
+            self.pipeline_b.restart_stream();
+        } else {
+            for p in [&mut self.pipeline_a, &mut self.pipeline_b] {
+                p.lan_routing = true;
+                p.sample_rate = 48000;
+                p.driver_backend = if self.lan_config.bridge == ServerBridge::RsbAsio { DriverBackend::RsbAsio } else { DriverBackend::AsioDspRsb };
+            }
+        }
     }
 
     fn restore_line_state(
@@ -1104,6 +1149,12 @@ impl RinkaSoundBridgeApp {
     }
 
     fn refresh_audio_devices(&mut self) {
+        if self.lan_config.role != LanRole::Local {
+            self.stop_lan();
+            (self.wasapi_inputs, self.wasapi_outputs) = get_wasapi_devices();
+            self.asio_drivers = get_asio_devices();
+            return;
+        }
         self.pipeline_a.stop_stream();
         self.pipeline_b.stop_stream();
         std::thread::sleep(Duration::from_millis(120));
@@ -1133,13 +1184,14 @@ impl RinkaSoundBridgeApp {
             return;
         }
         self.is_shut_down = true;
+        self.stop_lan();
         // Auto-Reset & Auto-Off GPU Boost Lock saat Rinka SoundBridge ditutup / dimatikan
-        if self.gpu_boost_lock_enabled || self.gpu_telemetry.is_boost_locked {
+        if self.lan_config.role != LanRole::Client && (self.gpu_boost_lock_enabled || self.gpu_telemetry.is_boost_locked) {
             self.gpu_boost_lock_enabled = false;
             self.gpu_telemetry.is_boost_locked = false;
             reset_gpu_boost_clock_lock_on_exit();
             log_info("[GPU Boost Lock] Auto-reset & disabled on application exit.");
-        } else {
+        } else if self.lan_config.role != LanRole::Client {
             reset_gpu_boost_clock_lock_on_exit();
         }
         self.tray_manager.remove_tray_icon();
@@ -1171,7 +1223,9 @@ impl RinkaSoundBridgeApp {
 
     fn periodic_background_tasks(&mut self, _ctx: &egui::Context) {
         self.enforce_live_dsp_b_cushion();
-        rinka_soundbridge_core::asio_host::inject_probe_into_running_vonovox_if_needed();
+        if self.lan_config.role != LanRole::Client {
+            rinka_soundbridge_core::asio_host::inject_probe_into_running_vonovox_if_needed();
+        }
         let (restored_from_tray, quit_from_tray) = self.tray_manager.poll_events();
         if quit_from_tray || is_tray_quit_requested() {
             self.clean_shutdown();
@@ -1213,7 +1267,9 @@ impl RinkaSoundBridgeApp {
             let (cpu, ram) = self.perf_monitor.sample();
             self.cpu_pct = cpu;
             self.ram_mb = ram;
-            self.gpu_telemetry = poll_gpu_clock_telemetry_with_failsafe(self.gpu_boost_lock_failsafe);
+            if self.lan_config.role != LanRole::Client {
+                self.gpu_telemetry = poll_gpu_clock_telemetry_with_failsafe(self.gpu_boost_lock_failsafe);
+            }
             if self.gpu_boost_lock_enabled && !self.gpu_telemetry.is_boost_locked {
                 self.gpu_boost_lock_enabled = false;
                 self.trigger_auto_save();
@@ -1242,7 +1298,7 @@ impl RinkaSoundBridgeApp {
             self.last_watchdog_tick = now;
             let _ = self.pipeline_a.check_stream_health();
             let _ = self.pipeline_b.check_stream_health();
-            asio_diag_poll();
+            if self.lan_config.role != LanRole::Client { asio_diag_poll(); }
         }
 
         if now.saturating_duration_since(self.last_latency_tick) >= Duration::from_millis(1000) {
@@ -1574,6 +1630,7 @@ impl RinkaSoundBridgeApp {
     }
 
     fn render_line_panel(&mut self, ui: &mut egui::Ui, target: ActiveLineTarget) {
+        let lan_server = self.lan_config.role == LanRole::Server;
         let is_line_a = target == ActiveLineTarget::LineA;
         let title = if is_line_a { "Line A" } else { "Line B" };
 
@@ -1822,6 +1879,11 @@ impl RinkaSoundBridgeApp {
 
                 // 3. GROUPBOX: Audio Device
                 draw_groupbox(ui, GroupIcon::Mic, "Audio Device", |ui| {
+                    if lan_server {
+                        ui.label(if is_line_a { "Input: LAN microphone · Output: virtual ASIO" }
+                            else { "Input: virtual ASIO · Output: LAN return" });
+                        return;
+                    }
                     let full_w = ui.available_width();
 
                     if pipeline.driver_backend == DriverBackend::AsioNative {
@@ -5461,6 +5523,14 @@ impl eframe::App for RinkaSoundBridgeApp {
         self.periodic_background_tasks(ctx);
         restore_host_gl_context();
         ctx.request_repaint_after(Duration::from_millis(33));
+        egui::TopBottomPanel::top("application_mode").show(ctx, |ui| self.render_mode_selector(ui));
+        if self.lan_config.role == LanRole::Client {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.render_lan_controls(ui));
+            });
+            restore_host_gl_context();
+            return;
+        }
 
         // Panel Bawah: Indikator Delay Voice Changer & Live2D (L2D) dengan fitur Toggle Hide/Show
         // Dirender menggunakan TopBottomPanel::bottom agar ruangnya selalu dipesan lebih dulu dan TIDAK PERNAH terpotong!
@@ -5587,7 +5657,8 @@ impl eframe::App for RinkaSoundBridgeApp {
                                             );
                                             ui.label(
                                                 RichText::new(
-                                                    "Total Voice Changer Delay (In A -> Out B):",
+                                                    if self.lan_config.role == LanRole::Server { "Server Processing Delay (In A -> Out B):" }
+                                                    else { "Total Voice Changer Delay (In A -> Out B):" },
                                                 )
                                                 .size(12.5)
                                                 .strong()
@@ -5672,7 +5743,8 @@ impl eframe::App for RinkaSoundBridgeApp {
                     }),
             )
             .show(ctx, |ui| {
-                self.render_header(ui, ctx);
+                if self.lan_config.role == LanRole::Server { self.render_lan_controls(ui); }
+                else { self.render_header(ui, ctx); }
                 ui.add_space(8.0);
 
                 ui.columns(2, |cols| {

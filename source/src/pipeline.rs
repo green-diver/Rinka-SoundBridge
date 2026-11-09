@@ -251,6 +251,10 @@ enum ActiveStreamEngine {
 }
 
 pub struct AudioPipeline {
+    /// Server mode reserves routing for LAN even while stopped or editing ASIO settings.
+    pub lan_routing: bool,
+    /// LAN server workers own processing while this is set; UI restarts must not open devices.
+    pub lan_managed: bool,
     pub name: String,
     pub shared: Arc<SharedAudioState>,
     pub vst_slots: Vec<Arc<VSTSlot>>,
@@ -325,6 +329,8 @@ impl AudioPipeline {
         });
 
         Self {
+            lan_routing: false,
+            lan_managed: false,
             name: name.to_string(),
             shared,
             vst_slots: Vec::new(),
@@ -362,6 +368,7 @@ impl AudioPipeline {
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.shared.is_enabled.store(enabled, Ordering::Relaxed);
+        if self.lan_routing { return; }
         self.reset_watchdog();
         if !enabled {
             self.stop_stream();
@@ -558,7 +565,7 @@ impl AudioPipeline {
     }
 
     pub fn streams_running(&self) -> bool {
-        !matches!(self.engine, ActiveStreamEngine::None)
+        self.lan_managed || !matches!(self.engine, ActiveStreamEngine::None)
     }
 
     pub fn set_fifo_mode(&mut self, mode: &str) {
@@ -624,6 +631,7 @@ impl AudioPipeline {
     }
 
     pub fn restart_stream(&mut self) {
+        if self.lan_routing { return; }
         self.stop_stream();
         if !self.is_enabled() {
             self.status_message = "⚪ Line Disabled (OFF)".to_string();
@@ -2120,6 +2128,7 @@ impl AudioPipeline {
 
     pub fn check_stream_health(&mut self) -> bool {
         self.purge_graveyard(1.5);
+        if self.lan_routing { return false; }
         if !self.is_enabled() || !self.streams_running() {
             return false;
         }
@@ -2215,6 +2224,78 @@ impl AudioPipeline {
 
 /// Menjalankan rantai DSP Input (DC Blocker + Overlay Input + VST3 Chain + Mode Aman + Soft Limiter)
 /// secara in-place pada slice `left` dan `right`.
+/// A server-side line processor that shares the existing VST, gain and overlay state.
+/// No local capture/render endpoint is opened here.
+pub(crate) struct LanLineProcessor {
+    shared: Arc<SharedAudioState>,
+    scratch: AudioScratchBuffers,
+}
+
+impl AudioPipeline {
+    pub(crate) fn prepare_lan(&mut self, bridge: crate::lan::ServerBridge) -> LanLineProcessor {
+        use crate::lan::protocol::{RATE, FRAMES};
+        self.stop_stream();
+        self.lan_routing = true;
+        self.sample_rate = RATE;
+        self.driver_backend = if bridge == crate::lan::ServerBridge::RsbAsio {
+            DriverBackend::RsbAsio
+        } else { DriverBackend::AsioDspRsb };
+        self.shared.active_sample_rate.store(RATE, Ordering::Relaxed);
+        self.shared.buffer_size.store(self.buffer_size, Ordering::Relaxed);
+        self.shared.is_asio_dsp_rsb.store(true, Ordering::Relaxed);
+        self.shared.is_rsb_asio.store(bridge == crate::lan::ServerBridge::RsbAsio, Ordering::Relaxed);
+        self.shared.is_direct_bridge_in.store(self.name == "Line B", Ordering::Relaxed);
+        self.shared.probe_in.set_sample_rate(RATE, 1.8);
+        self.shared.probe_out.set_sample_rate(RATE, 1.8);
+        self.sync_overlay_rates(RATE);
+        for slot in &self.vst_slots {
+            if let Some(ref mut plugin) = *slot.audio_proc.lock() {
+                plugin.setup_processing(RATE as f64, 4096);
+                plugin.reset();
+            }
+            slot.flush_pending.store(true, Ordering::Relaxed);
+        }
+        self.lan_managed = true;
+        self.status_message = if self.name == "Line A" { "LAN microphone -> VST -> virtual ASIO" } else {
+            "Virtual ASIO -> VST -> LAN return"
+        }.into();
+        LanLineProcessor { shared: Arc::clone(&self.shared), scratch: AudioScratchBuffers::with_capacity(FRAMES) }
+    }
+    pub fn stop_lan(&mut self) {
+        self.lan_managed = false;
+        self.stop_stream();
+    }
+}
+
+impl LanLineProcessor {
+    pub fn reset(&mut self) {
+        self.shared.dc_blocker.lock().reset();
+        for slot in self.shared.chain.load().iter() { slot.reset_pending.store(true, Ordering::Relaxed); }
+    }
+    pub fn input(&mut self, data: &[f32]) {
+        let frames = data.len() / 2;
+        if self.shared.is_enabled.load(Ordering::Relaxed) {
+            process_input_block(&self.shared, &mut self.scratch, data, 2, frames);
+        } else {
+            self.scratch.bus_l[..frames].fill(0.0);
+            self.scratch.bus_r[..frames].fill(0.0);
+            get_dsp_rsb_bus_a_out().write_stereo(&self.scratch.bus_l[..frames], &self.scratch.bus_r[..frames], 4800);
+        }
+    }
+    pub fn output(&mut self, data: &mut [f32], rsb: bool, steady_cushion: usize) {
+        let frames = data.len() / 2;
+        if rsb {
+            get_dsp_rsb_bus_b_in().read_stereo_rsb_flex_b_into(
+                &mut self.scratch.bus_l[..frames], &mut self.scratch.bus_r[..frames], steady_cushion);
+        } else {
+            let (cushion, stretch) = get_dsp_rsb_bus_b_in().get_dsp_b_params();
+            get_dsp_rsb_bus_b_in().read_stereo_dsp_b_into(
+                &mut self.scratch.bus_l[..frames], &mut self.scratch.bus_r[..frames], cushion, stretch);
+        }
+        process_and_render_direct_stereo_from_scratch(&self.shared, &mut self.scratch, data, 2, frames);
+    }
+}
+
 fn run_dsp_vst_chain_stereo(
     shared: &SharedAudioState,
     left: &mut [f32],

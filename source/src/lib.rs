@@ -20,3 +20,4 @@ pub mod wasapi_exclusive;
 pub mod vst3_host;
 pub mod pipeline;
 pub mod config;
+pub mod lan;

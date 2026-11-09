@@ -546,6 +546,8 @@ impl Default for RsbAsioConfig {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct AppConfig {
     #[serde(default)]
+    pub lan: crate::lan::LanConfig,
+    #[serde(default)]
     pub global: GlobalConfig,
     #[serde(default)]
     pub line_a: LineConfig,
